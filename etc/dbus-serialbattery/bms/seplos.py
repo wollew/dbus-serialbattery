@@ -144,12 +144,12 @@ class Seplos(Battery):
             if manufacturer != b"CAN:PNG_DYE_Luxp_TBB":
                 logger.warning(
                     "Unknown BMS, Model {}, SW Version {}.{}, Manufacturer Info {}"
-                ).format(part_model, sw_version_major, sw_version_minor, manufacturer)
+                .format(part_model, sw_version_major, sw_version_minor, manufacturer))
                 return False
             else:
                 logger.info(
                     "Detected Seplos BMS, Model {}, SW Version {}.{}, Manufacturer Info {}"
-                ).format(part_model, sw_version_major, sw_version_minor, manufacturer)
+                .format(part_model, sw_version_major, sw_version_minor, manufacturer))
                 return True
         except (ValueError, UnicodeDecodeError) as e:
             logger.warning("could not hex-decode raw vendor info data", exc_info=e)
