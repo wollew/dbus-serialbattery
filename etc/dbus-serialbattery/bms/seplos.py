@@ -27,7 +27,12 @@ class Seplos(Battery):
                 signed=signed,
             )
         except (UnicodeDecodeError, ValueError) as e:
-            logger.warning("could not hex-decode {}, returning 0".format(data[offset : offset + 2]), exc_info=e)
+            logger.warning(
+                "could not hex-decode {}, returning 0".format(
+                    data[offset : offset + 2]
+                ),
+                exc_info=e,
+            )
             return 0
 
     @staticmethod
@@ -39,7 +44,12 @@ class Seplos(Battery):
                 signed=signed,
             )
         except (UnicodeDecodeError, ValueError) as e:
-            logger.warning("could not hex-decode {}, returning 0".format(data[offset : offset + 4]), exc_info=e)
+            logger.warning(
+                "could not hex-decode {}, returning 0".format(
+                    data[offset : offset + 4]
+                ),
+                exc_info=e,
+            )
             return 0
 
     @staticmethod
