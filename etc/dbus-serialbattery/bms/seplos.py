@@ -20,37 +20,19 @@ class Seplos(Battery):
 
     @staticmethod
     def int_from_1byte_hex_ascii(data: bytes, offset: int, signed=False):
-        try:
-            return int.from_bytes(
-                bytes.fromhex(data[offset : offset + 2].decode("ascii")),
-                byteorder="big",
-                signed=signed,
-            )
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.warning(
-                "could not hex-decode {}, returning 0".format(
-                    data[offset : offset + 2]
-                ),
-                exc_info=e,
-            )
-            return 0
+        return int.from_bytes(
+            bytes.fromhex(data[offset : offset + 2].decode("ascii")),
+            byteorder="big",
+            signed=signed,
+        )
 
     @staticmethod
     def int_from_2byte_hex_ascii(data: bytes, offset: int, signed=False):
-        try:
-            return int.from_bytes(
-                bytes.fromhex(data[offset : offset + 4].decode("ascii")),
-                byteorder="big",
-                signed=signed,
-            )
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.warning(
-                "could not hex-decode {}, returning 0".format(
-                    data[offset : offset + 4]
-                ),
-                exc_info=e,
-            )
-            return 0
+        return int.from_bytes(
+            bytes.fromhex(data[offset : offset + 4].decode("ascii")),
+            byteorder="big",
+            signed=signed,
+        )
 
     @staticmethod
     def get_checksum(frame: bytes) -> int:
