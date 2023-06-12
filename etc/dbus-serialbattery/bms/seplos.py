@@ -244,7 +244,8 @@ class Seplos(Battery):
         if data is False or len(data) != 150:
             return False
 
-        self.decode_status_data(data)
+        if not self.decode_status_data(data):
+            return False
 
         return True
 
@@ -297,6 +298,8 @@ class Seplos(Battery):
         )
         logger.debug("HW:" + self.hardware_version)
 
+        return True
+
     @staticmethod
     def is_valid_frame(data: bytes) -> bool:
         """checks if data contains a valid frame
@@ -306,7 +309,7 @@ class Seplos(Battery):
         * not checked: lchksum
         """
         if len(data) < 18:
-            logger.warning("short read, data={}".format(data))
+            logger.debug("short read, data={}".format(data))
             return False
 
         chksum = Seplos.get_checksum(data[1:-5])
