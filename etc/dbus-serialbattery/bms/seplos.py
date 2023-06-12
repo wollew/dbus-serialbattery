@@ -137,6 +137,22 @@ class Seplos(Battery):
 
         return result_status and result_alarm
 
+    def read_vendor_data(self):
+        logger.debug("read vendor data")
+        data = self.read_serial_data_seplos(
+            self.encode_cmd(address=0x00, cid2=self.COMMAND_VENDOR_INFO, info=b"01")
+        )
+        # check if we could successfully read data and we have the expected length of 98 bytes
+        if data is False: # or len(data) != 98:
+            return False
+
+        try:
+            logger.debug("vendor info raw {}".format(data))
+            return self.decode_alarm_data(bytes.fromhex(data.decode("ascii")))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("could not hex-decode raw alarm data", exc_info=e)
+            return False
+
     @staticmethod
     def decode_alarm_byte(data_byte: int, alarm_bit: int, warn_bit: int):
         if data_byte & (1 << alarm_bit) != 0:
