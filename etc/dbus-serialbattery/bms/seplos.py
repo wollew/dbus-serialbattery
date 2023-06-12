@@ -99,7 +99,7 @@ class Seplos(Battery):
         # Return True if success, False for failure
         result = False
         try:
-            result = self.read_status_data()
+            result = self.read_vendor_data()
         except Exception as err:
             logger.error(f"Unexpected {err=}, {type(err)=}")
             result = False
@@ -142,15 +142,35 @@ class Seplos(Battery):
         data = self.read_serial_data_seplos(
             self.encode_cmd(address=0x00, cid2=self.COMMAND_VENDOR_INFO, info=b"01")
         )
-        # check if we could successfully read data and we have the expected length of 98 bytes
-        if data is False: # or len(data) != 98:
+        # check if we could successfully read data and read at least 64 byte
+        if data is False or len(data) < 64:
             return False
 
+        logger.debug("vendor info raw {}".format(data))
+        return self.decode_vendor_data(data)
+
+    def decode_vendor_data(self, data):
+        # reading vendor info is unfortunately undocumented, so we're doing some guess work
+        # Seplos seems to report "CAN:PNG_DYE_Luxp_TBB" as Manufacturer, using this as identifying property
+        # please let us know if there's a better way to recognize a Seplos
         try:
-            logger.debug("vendor info raw {}".format(data))
-            return self.decode_alarm_data(bytes.fromhex(data.decode("ascii")))
+            decoded = bytes.fromhex(data.decode("ascii"))
+            part_model = decoded[0:10]
+            sw_version_major = decoded[10]
+            sw_version_minor = decoded[11]
+            manufacturer = decoded[12:33]
+            if manufacturer != b"CAN:PNG_DYE_Luxp_TBB":
+                logger.warning(
+                    "Unknown BMS, Model {}, SW Version {}.{}, Manufacturer Info {}"
+                ).format(part_model, sw_version_major, sw_version_minor, manufacturer)
+                return False
+            else:
+                logger.info(
+                    "Detected Seplos BMS, Model {}, SW Version {}.{}, Manufacturer Info {}"
+                ).format(part_model, sw_version_major, sw_version_minor, manufacturer)
+                return True
         except (ValueError, UnicodeDecodeError) as e:
-            logger.warning("could not hex-decode raw alarm data", exc_info=e)
+            logger.warning("could not hex-decode raw vendor info data", exc_info=e)
             return False
 
     @staticmethod
