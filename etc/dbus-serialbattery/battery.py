@@ -83,6 +83,8 @@ class Battery(ABC):
         """
         self.voltage = None
         self.current = None
+        self.current_avg = None
+        self.current_avg_lst = []
         self.capacity_remain = None
         self.capacity = None
         self.cycles = None
@@ -104,11 +106,17 @@ class Battery(ABC):
         self.cells: List[Cell] = []
         self.control_charging = None
         self.control_voltage = None
+        self.bulk_requested = False
+        self.bulk_last_reached = 0
+        self.bulk_battery_voltage = None
         self.max_battery_voltage = None
         self.min_battery_voltage = None
         self.allow_max_voltage = True
         self.max_voltage_start_time = None
+        self.transition_start_time = None
+        self.control_voltage_at_transition_start = None
         self.charge_mode = None
+        self.charge_mode_debug = ""
         self.charge_limitation = None
         self.discharge_limitation = None
         self.linear_cvl_last_set = 0
@@ -141,7 +149,7 @@ class Battery(ABC):
         On +/- 5 Ah you can identify 11 batteries
         """
         string = (
-            "".join(filter(str.isalnum, self.hardware_version)) + "_"
+            "".join(filter(str.isalnum, str(self.hardware_version))) + "_"
             if self.hardware_version is not None and self.hardware_version != ""
             else ""
         )
@@ -236,8 +244,40 @@ class Battery(ABC):
             self.charge_mode = "Keep always max voltage"
 
     def prepare_voltage_management(self) -> None:
-        self.max_battery_voltage = utils.MAX_CELL_VOLTAGE * self.cell_count
-        self.min_battery_voltage = utils.MIN_CELL_VOLTAGE * self.cell_count
+        bulk_last_reached_days_ago = (
+            0
+            if self.bulk_last_reached == 0
+            else (((int(time()) - self.bulk_last_reached) / 60 / 60 / 24))
+        )
+        # set bulk_requested to True, if the days are over
+        # it gets set to False once the bulk voltage was reached once
+        if (
+            utils.BULK_AFTER_DAYS is not False
+            and self.bulk_requested is False
+            and self.allow_max_voltage
+            and (
+                self.bulk_last_reached == 0
+                or utils.BULK_AFTER_DAYS < bulk_last_reached_days_ago
+            )
+        ):
+            """
+            logger.info(
+                f"set bulk_requested to True: first time (0) or {utils.BULK_AFTER_DAYS}"
+                + f" < {round(bulk_last_reached_days_ago, 2)}"
+            )
+            """
+            self.bulk_requested = True
+
+        self.bulk_battery_voltage = round(utils.BULK_CELL_VOLTAGE * self.cell_count, 2)
+
+        if self.bulk_requested:
+            self.max_battery_voltage = self.bulk_battery_voltage
+        else:
+            self.max_battery_voltage = round(
+                utils.MAX_CELL_VOLTAGE * self.cell_count, 2
+            )
+
+        self.min_battery_voltage = round(utils.MIN_CELL_VOLTAGE * self.cell_count, 2)
 
     def manage_charge_voltage_linear(self) -> None:
         """
@@ -248,19 +288,33 @@ class Battery(ABC):
         voltageSum = 0
         penaltySum = 0
         tDiff = 0
+        current_time = int(time())
+
+        # meassurment and variation tolerance in volts
+        measurementToleranceVariation = 0.5
 
         try:
-            # calculate battery sum
+            # calculate battery sum and check for cell overvoltage
             for i in range(self.cell_count):
                 voltage = self.get_cell_voltage(i)
                 if voltage:
                     voltageSum += voltage
 
                     # calculate penalty sum to prevent single cell overcharge by using current cell voltage
-                    if voltage > utils.MAX_CELL_VOLTAGE:
+                    if (
+                        self.max_battery_voltage != self.bulk_battery_voltage
+                        and voltage > utils.MAX_CELL_VOLTAGE
+                    ):
                         # foundHighCellVoltage: reset to False is not needed, since it is recalculated every second
                         foundHighCellVoltage = True
                         penaltySum += voltage - utils.MAX_CELL_VOLTAGE
+                    elif (
+                        self.max_battery_voltage == self.bulk_battery_voltage
+                        and voltage > utils.BULK_CELL_VOLTAGE
+                    ):
+                        # foundHighCellVoltage: reset to False is not needed, since it is recalculated every second
+                        foundHighCellVoltage = True
+                        penaltySum += voltage - utils.BULK_CELL_VOLTAGE
 
             voltageDiff = self.get_max_cell_voltage() - self.get_min_cell_voltage()
 
@@ -271,7 +325,7 @@ class Battery(ABC):
                     and voltageDiff <= utils.CELL_VOLTAGE_DIFF_KEEP_MAX_VOLTAGE_UNTIL
                     and self.allow_max_voltage
                 ):
-                    self.max_voltage_start_time = int(time())
+                    self.max_voltage_start_time = current_time
 
                 # allow max voltage again, if cells are unbalanced or SoC threshold is reached
                 elif (
@@ -279,77 +333,103 @@ class Battery(ABC):
                     or voltageDiff >= utils.CELL_VOLTAGE_DIFF_TO_RESET_VOLTAGE_LIMIT
                 ) and not self.allow_max_voltage:
                     self.allow_max_voltage = True
+                else:
+                    pass
+
             else:
-                tDiff = int(time()) - self.max_voltage_start_time
-                # if utils.MAX_VOLTAGE_TIME_SEC < tDiff:
-                # keep max voltage for 300 more seconds
-                if 300 < tDiff:
+                tDiff = current_time - self.max_voltage_start_time
+                # keep max voltage for MAX_VOLTAGE_TIME_SEC more seconds
+                if utils.MAX_VOLTAGE_TIME_SEC < tDiff:
                     self.allow_max_voltage = False
                     self.max_voltage_start_time = None
+                    if self.soc <= utils.SOC_LEVEL_TO_RESET_VOLTAGE_LIMIT:
+                        # write to log, that reset to float was not possible
+                        logger.error(
+                            f"Could not change to float voltage. Battery SoC ({self.soc}%) is lower"
+                            + f" than SOC_LEVEL_TO_RESET_VOLTAGE_LIMIT ({utils.SOC_LEVEL_TO_RESET_VOLTAGE_LIMIT}%)."
+                            + " Please reset SoC manually or lower the SOC_LEVEL_TO_RESET_VOLTAGE_LIMIT in the"
+                            + ' "config.ini".'
+                        )
+
                 # we don't forget to reset max_voltage_start_time wenn we going to bulk(dynamic) mode
                 # regardless of whether we were in absorption mode or not
-                if voltageSum < self.max_battery_voltage - utils.VOLTAGE_DROP:
+                if (
+                    voltageSum
+                    < self.max_battery_voltage
+                    - utils.VOLTAGE_DROP
+                    - measurementToleranceVariation
+                ):
                     self.max_voltage_start_time = None
 
             # INFO: battery will only switch to Absorption, if all cells are balanced.
             #       Reach MAX_CELL_VOLTAGE * cell count if they are all balanced.
             if foundHighCellVoltage and self.allow_max_voltage:
-                # set CVL only once every LINEAR_RECALCULATION_EVERY seconds
-                if (
-                    int(time()) - self.linear_cvl_last_set
-                    >= utils.LINEAR_RECALCULATION_EVERY
-                ):
-                    self.linear_cvl_last_set = int(time())
-
-                    # Keep penalty above min battery voltage and below max battery voltage
-                    self.control_voltage = round(
-                        min(
-                            max(
-                                voltageSum - penaltySum,
-                                self.min_battery_voltage,
-                            ),
-                            self.max_battery_voltage,
+                # Keep penalty above min battery voltage and below max battery voltage
+                control_voltage = round(
+                    min(
+                        max(
+                            voltageSum - penaltySum,
+                            self.min_battery_voltage,
                         ),
-                        3,
-                    )
+                        self.max_battery_voltage,
+                    ),
+                    3,
+                )
+                self.set_cvl_linear(control_voltage)
 
                 self.charge_mode = (
                     "Bulk dynamic"
-                    # + " (vS: "
-                    # + str(round(voltageSum, 2))
-                    # + " - pS: "
-                    # + str(round(penaltySum, 2))
-                    # + ")"
-                    if self.max_voltage_start_time is None
+                    # if self.max_voltage_start_time is None  # remove this line after testing
+                    if self.max_battery_voltage == self.bulk_battery_voltage
                     else "Absorption dynamic"
-                    # + "(vS: "
-                    # + str(round(voltageSum, 2))
-                    # + " tDiff: "
-                    # + str(tDiff)
-                    # + " pS: "
-                    # + str(round(penaltySum, 2))
-                    # + ")"
                 )
 
             elif self.allow_max_voltage:
                 self.control_voltage = round(self.max_battery_voltage, 3)
                 self.charge_mode = (
-                    # "Bulk" if self.max_voltage_start_time is None else "Absorption"
                     "Bulk"
-                    if self.max_voltage_start_time is None
+                    # if self.max_voltage_start_time is None  # remove this line after testing
+                    if self.max_battery_voltage == self.bulk_battery_voltage
                     else "Absorption"
                 )
 
             else:
                 floatVoltage = round((utils.FLOAT_CELL_VOLTAGE * self.cell_count), 3)
+                chargeMode = "Float"
+                # reset bulk when going into float
+                if self.bulk_requested:
+                    # logger.info("set bulk_requested to False")
+                    self.bulk_requested = False
+                    # IDEA: Save "bulk_last_reached" in the dbus path com.victronenergy.settings
+                    # to make it restart persistent
+                    self.bulk_last_reached = current_time
                 if self.control_voltage:
-                    if self.control_voltage >= (floatVoltage + 0.005):
-                        self.control_voltage -= 0.005
-                    else:
-                        self.control_voltage = floatVoltage
+                    # check if battery changed from bulk/absoprtion to float
+                    if not self.charge_mode.startswith("Float"):
+                        self.transition_start_time = current_time
+                        self.initial_control_voltage = self.control_voltage
+                        chargeMode = "Float Transition"
+                        # Assume battery SOC ist 100% at this stage
+                        self.trigger_soc_reset()
+                    elif self.charge_mode.startswith("Float Transition"):
+                        elapsed_time = current_time - self.transition_start_time
+                        # Voltage reduction per second
+                        VOLTAGE_REDUCTION_PER_SECOND = 0.01 / 10
+                        voltage_reduction = min(
+                            VOLTAGE_REDUCTION_PER_SECOND * elapsed_time,
+                            self.initial_control_voltage - floatVoltage,
+                        )
+                        self.set_cvl_linear(
+                            self.initial_control_voltage - voltage_reduction
+                        )
+                        if self.control_voltage <= floatVoltage:
+                            self.control_voltage = floatVoltage
+                            chargeMode = "Float"
+                        else:
+                            chargeMode = "Float Transition"
                 else:
                     self.control_voltage = floatVoltage
-                self.charge_mode = "Float"
+                self.charge_mode = chargeMode
 
             if (
                 self.allow_max_voltage
@@ -360,9 +440,62 @@ class Battery(ABC):
 
             self.charge_mode += " (Linear Mode)"
 
+            # uncomment for enabling debugging infos in GUI
+            """
+            self.charge_mode_debug = (
+                f"max_battery_voltage: {round(self.max_battery_voltage, 2)}V"
+            )
+            self.charge_mode_debug += (
+                f" - VOLTAGE_DROP: {round(utils.VOLTAGE_DROP, 2)}V"
+            )
+            self.charge_mode_debug += f"\nvoltageSum: {round(voltageSum, 2)}V"
+            self.charge_mode_debug += f" • voltageDiff: {round(voltageDiff, 3)}V"
+            self.charge_mode_debug += (
+                f"\ncontrol_voltage: {round(self.control_voltage, 2)}V"
+            )
+            self.charge_mode_debug += f" • penaltySum: {round(penaltySum, 3)}V"
+            self.charge_mode_debug += f"\ntDiff: {tDiff}/{utils.MAX_VOLTAGE_TIME_SEC}"
+            self.charge_mode_debug += f" • SoC: {self.soc}%"
+            self.charge_mode_debug += (
+                f" • Reset SoC: {utils.SOC_LEVEL_TO_RESET_VOLTAGE_LIMIT}%"
+            )
+            self.charge_mode_debug += f"\nallow_max_voltage: {self.allow_max_voltage}"
+            self.charge_mode_debug += (
+                f"\nmax_voltage_start_time: {self.max_voltage_start_time}"
+            )
+            self.charge_mode_debug += f"\ncurrent_time: {current_time}"
+            self.charge_mode_debug += (
+                f"\nlinear_cvl_last_set: {self.linear_cvl_last_set}"
+            )
+            bulk_days_ago = round(
+                (current_time - self.bulk_last_reached) / 60 / 60 / 24, 2
+            )
+            bulk_in_days = round(utils.BULK_AFTER_DAYS - bulk_days_ago, 2)
+            self.charge_mode_debug += "\nbulk_last_reached: " + str(
+                "Never"
+                if self.bulk_last_reached == 0
+                else str(bulk_days_ago)
+                + " days ago - next in "
+                + str(bulk_in_days)
+                + "days"
+            )
+            # """
+
         except TypeError:
             self.control_voltage = None
             self.charge_mode = "--"
+
+    def set_cvl_linear(self, control_voltage) -> bool:
+        """
+        set CVL only once every LINEAR_RECALCULATION_EVERY seconds
+        :return: bool
+        """
+        current_time = int(time())
+        if utils.LINEAR_RECALCULATION_EVERY <= current_time - self.linear_cvl_last_set:
+            self.control_voltage = control_voltage
+            self.linear_cvl_last_set = current_time
+            return True
+        return False
 
     def manage_charge_voltage_step(self) -> None:
         """
@@ -371,6 +504,7 @@ class Battery(ABC):
         """
         voltageSum = 0
         tDiff = 0
+        current_time = int(time())
 
         try:
             # calculate battery sum
@@ -386,7 +520,7 @@ class Battery(ABC):
                     and self.allow_max_voltage
                 ):
                     # example 2
-                    self.max_voltage_start_time = time()
+                    self.max_voltage_start_time = current_time
 
                 # check if reset soc is greater than battery soc
                 # this prevents flapping between max and float voltage
@@ -402,7 +536,7 @@ class Battery(ABC):
 
             # timer started
             else:
-                tDiff = time() - self.max_voltage_start_time
+                tDiff = current_time - self.max_voltage_start_time
                 if utils.MAX_VOLTAGE_TIME_SEC < tDiff:
                     self.allow_max_voltage = False
                     self.max_voltage_start_time = None
@@ -417,8 +551,17 @@ class Battery(ABC):
                 )
 
             else:
+                # check if battery changed from bulk/absoprtion to float
+                if not self.charge_mode.startswith("Float"):
+                    # Assume battery SOC ist 100% at this stage
+                    self.trigger_soc_reset()
                 self.control_voltage = utils.FLOAT_CELL_VOLTAGE * self.cell_count
                 self.charge_mode = "Float"
+                # reset bulk when going into float
+                if self.bulk_requested:
+                    # logger.info("set bulk_requested to False")
+                    self.bulk_requested = False
+                    self.bulk_last_reached = current_time
 
             self.charge_mode += " (Step Mode)"
 
@@ -428,17 +571,24 @@ class Battery(ABC):
 
     def manage_charge_current(self) -> None:
         # Manage Charge Current Limitations
-        charge_limits = {utils.MAX_BATTERY_CHARGE_CURRENT: "Config Limit"}
+        charge_limits = {utils.MAX_BATTERY_CHARGE_CURRENT: "Max Battery Charge Current"}
 
-        # if values are not the same, then the limit was read also from the BMS
-        if utils.MAX_BATTERY_CHARGE_CURRENT != self.max_battery_charge_current:
-            charge_limits.update({self.max_battery_charge_current: "BMS Limit"})
+        # if BMS limit is lower then config limit and therefore the values are not the same,
+        # then the limit was also read from the BMS
+        if utils.MAX_BATTERY_CHARGE_CURRENT > self.max_battery_charge_current:
+            charge_limits.update({self.max_battery_charge_current: "BMS Settings"})
 
         if utils.CCCM_CV_ENABLE:
             tmp = self.calcMaxChargeCurrentReferringToCellVoltage()
             if self.max_battery_charge_current != tmp:
                 if tmp in charge_limits:
-                    charge_limits.update({tmp: charge_limits[tmp] + ", Cell Voltage"})
+                    # do not add string, if global limitation is applied
+                    if charge_limits[tmp] != "Max Battery Charge Current":
+                        charge_limits.update(
+                            {tmp: charge_limits[tmp] + ", Cell Voltage"}
+                        )
+                    else:
+                        pass
                 else:
                     charge_limits.update({tmp: "Cell Voltage"})
 
@@ -446,7 +596,11 @@ class Battery(ABC):
             tmp = self.calcMaxChargeCurrentReferringToTemperature()
             if self.max_battery_charge_current != tmp:
                 if tmp in charge_limits:
-                    charge_limits.update({tmp: charge_limits[tmp] + ", Temp"})
+                    # do not add string, if global limitation is applied
+                    if charge_limits[tmp] != "Max Battery Charge Current":
+                        charge_limits.update({tmp: charge_limits[tmp] + ", Temp"})
+                    else:
+                        pass
                 else:
                     charge_limits.update({tmp: "Temp"})
 
@@ -454,7 +608,11 @@ class Battery(ABC):
             tmp = self.calcMaxChargeCurrentReferringToSoc()
             if self.max_battery_charge_current != tmp:
                 if tmp in charge_limits:
-                    charge_limits.update({tmp: charge_limits[tmp] + ", SoC"})
+                    # do not add string, if global limitation is applied
+                    if charge_limits[tmp] != "Max Battery Charge Current":
+                        charge_limits.update({tmp: charge_limits[tmp] + ", SoC"})
+                    else:
+                        pass
                 else:
                     charge_limits.update({tmp: "SoC"})
 
@@ -492,19 +650,28 @@ class Battery(ABC):
         #####
 
         # Manage Discharge Current Limitations
-        discharge_limits = {utils.MAX_BATTERY_DISCHARGE_CURRENT: "Config Limit"}
+        discharge_limits = {
+            utils.MAX_BATTERY_DISCHARGE_CURRENT: "Max Battery Discharge Current"
+        }
 
-        # if values are not the same, then the limit was read also from the BMS
-        if utils.MAX_BATTERY_DISCHARGE_CURRENT != self.max_battery_discharge_current:
-            discharge_limits.update({self.max_battery_discharge_current: "BMS Limit"})
+        # if BMS limit is lower then config limit and therefore the values are not the same,
+        # then the limit was also read from the BMS
+        if utils.MAX_BATTERY_DISCHARGE_CURRENT > self.max_battery_discharge_current:
+            discharge_limits.update(
+                {self.max_battery_discharge_current: "BMS Settings"}
+            )
 
         if utils.DCCM_CV_ENABLE:
             tmp = self.calcMaxDischargeCurrentReferringToCellVoltage()
             if self.max_battery_discharge_current != tmp:
                 if tmp in discharge_limits:
-                    discharge_limits.update(
-                        {tmp: discharge_limits[tmp] + ", Cell Voltage"}
-                    )
+                    # do not add string, if global limitation is applied
+                    if discharge_limits[tmp] != "Max Battery Discharge Current":
+                        discharge_limits.update(
+                            {tmp: discharge_limits[tmp] + ", Cell Voltage"}
+                        )
+                    else:
+                        pass
                 else:
                     discharge_limits.update({tmp: "Cell Voltage"})
 
@@ -512,7 +679,11 @@ class Battery(ABC):
             tmp = self.calcMaxDischargeCurrentReferringToTemperature()
             if self.max_battery_discharge_current != tmp:
                 if tmp in discharge_limits:
-                    discharge_limits.update({tmp: discharge_limits[tmp] + ", Temp"})
+                    # do not add string, if global limitation is applied
+                    if discharge_limits[tmp] != "Max Battery Discharge Current":
+                        discharge_limits.update({tmp: discharge_limits[tmp] + ", Temp"})
+                    else:
+                        pass
                 else:
                     discharge_limits.update({tmp: "Temp"})
 
@@ -520,7 +691,11 @@ class Battery(ABC):
             tmp = self.calcMaxDischargeCurrentReferringToSoc()
             if self.max_battery_discharge_current != tmp:
                 if tmp in discharge_limits:
-                    discharge_limits.update({tmp: discharge_limits[tmp] + ", SoC"})
+                    # do not add string, if global limitation is applied
+                    if discharge_limits[tmp] != "Max Battery Discharge Current":
+                        discharge_limits.update({tmp: discharge_limits[tmp] + ", SoC"})
+                    else:
+                        pass
                 else:
                     discharge_limits.update({tmp: "SoC"})
 
@@ -746,6 +921,14 @@ class Battery(ABC):
             diffSoc = socnum - self.soc
         else:
             diffSoc = self.soc - socnum
+
+        """
+        calculate only positive SoC points, since negative points have no sense
+        when charging only points above current SoC are shown
+        when discharging only points below current SoC are shown
+        """
+        if diffSoc < 0:
+            return None
 
         ttgStr = None
         if self.soc != socnum and (diffSoc > 0 or utils.TIME_TO_SOC_INC_FROM is True):
@@ -1219,4 +1402,10 @@ class Battery(ABC):
         return
 
     def turn_balancing_off_callback(self, path, value):
+        return
+
+    def trigger_soc_reset(self):
+        """
+        This method can be used to implement SOC reset when the battery is assumed to be full
+        """
         return

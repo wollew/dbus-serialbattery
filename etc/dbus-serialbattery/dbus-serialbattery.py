@@ -72,6 +72,9 @@ logger.info("Starting dbus-serialbattery")
 
 
 def main():
+    # NameError: free variable 'expected_bms_types' referenced before assignment in enclosing scope
+    global expected_bms_types
+
     def poll_battery(loop):
         helper.publish_battery(loop)
         return True
@@ -169,6 +172,28 @@ def main():
         if testbms.test_connection():
             logger.info("Connection established to " + testbms.__class__.__name__)
             battery = testbms
+    elif port.startswith("can"):
+        """
+        Import CAN classes only, if it's a can port, else the driver won't start due to missing python modules
+        This prevent problems when using the driver only with a serial connection
+        """
+        from bms.daly_can import Daly_Can
+        from bms.jkbms_can import Jkbms_Can
+
+        # only try CAN BMS on CAN port
+        supported_bms_types = [
+            {"bms": Daly_Can, "baud": 250000},
+            {"bms": Jkbms_Can, "baud": 250000},
+        ]
+
+        expected_bms_types = [
+            battery_type
+            for battery_type in supported_bms_types
+            if battery_type["bms"].__name__ in utils.BMS_TYPE
+            or len(utils.BMS_TYPE) == 0
+        ]
+
+        battery = get_battery(port)
     else:
         battery = get_battery(port)
 
